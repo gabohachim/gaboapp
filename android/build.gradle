@@ -1,46 +1,18 @@
-plugins {
-    id "com.android.application"
-    id "org.jetbrains.kotlin.android"
-    id "dev.flutter.flutter-gradle-plugin"
-}
-
-android {
-    namespace "com.gabo.vinylapp"
-applicationId "com.gabo.vinylapp"
-
-    compileSdkVersion flutter.compileSdkVersion
-
-    defaultConfig {
-        applicationId "com.example.app" // <- cambia por tu package real
-        minSdkVersion flutter.minSdkVersion
-        targetSdkVersion flutter.targetSdkVersion
-        versionCode flutter.versionCode
-        versionName flutter.versionName
-    }
-
-    buildTypes {
-        release {
-            // Si todavía no tienes keystore configurado en Codemagic,
-            // esto permite que el build siga (release unsigned).
-            signingConfig signingConfigs.debug
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
     }
 }
 
-flutter {
-    source "../.."
+rootProject.buildDir = "../build"
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(":app")
 }
 
-dependencies {
-    // normalmente Flutter maneja dependencias; deja vacío si no necesitas nada extra
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
 }
-
