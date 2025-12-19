@@ -1,170 +1,217 @@
 import 'dart:convert';
-import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
-import 'package:path_provider/path_provider.dart';
 
 class DriveBackupService {
   static const String backupFileName = 'vinyl_backup.json';
 
+  // Scope recomendado para respaldos ocultos en Drive (appDataFolder).
   static const List<String> _scopes = <String>[
     'https://www.googleapis.com/auth/drive.appdata',
   ];
 
-  static final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
+  static final GoogleSignIn _signIn = GoogleSignIn.instance;
+
   static bool _initialized = false;
+  static GoogleSignInAccount? _currentUser;
+
+  static GoogleSignInAccount? get currentUser => _currentUser;
 
   static Future<void> _ensureInitialized() async {
     if (_initialized) return;
-    await _googleSignIn.initialize(scopes: _scopes);
+
+    // En google_sign_in v7+ NO se pasan scopes aquí.
+    // La autorización de scopes se hace con authorizationClient.
+    await _signIn.initialize();
+
+    // Guardar usuario actual vía eventos.
+    _signIn.authenticationEvents.listen((event) {
+      if (event is GoogleSignInAuthenticationEventSignIn) {
+        _currentUser = event.user;
+      } else if (event is GoogleSignInAuthenticationEventSignOut) {
+        _currentUser = null;
+      }
+    });
+
     _initialized = true;
   }
 
-  static Future<GoogleSignInAccount?> signInInteractive() async {
-    await _ensureInitialized();
-    return _googleSignIn.authenticate();
-  }
-
-  static Future<GoogleSignInAccount?> signInSilentlyOrNull() async {
+  /// Intenta “silencioso” primero; si no, devuelve null.
+  static Future<GoogleSignInAccount?> _tryLightweight() async {
     await _ensureInitialized();
     try {
-      return await _googleSignIn.attemptLightweightAuthentication();
+      return await _signIn.attemptLightweightAuthentication();
     } catch (_) {
       return null;
     }
   }
 
+  /// Login interactivo (botón/acción usuario).
+  static Future<GoogleSignInAccount?> _interactive() async {
+    await _ensureInitialized();
+    return await _signIn.authenticate();
+  }
+
+  /// Lo que tu backup_service.dart espera.
+  static Future<GoogleSignInAccount?> ensureSignedIn({
+    required bool interactiveIfNeeded,
+  }) async {
+    final u1 = _currentUser ?? await _tryLightweight();
+    if (u1 != null) {
+      _currentUser = u1;
+      return u1;
+    }
+    if (!interactiveIfNeeded) return null;
+
+    final u2 = await _interactive();
+    _currentUser = u2;
+    return u2;
+  }
+
   static Future<void> signOut() async {
     await _ensureInitialized();
-    await _googleSignIn.signOut();
+    await _signIn.signOut();
+    _currentUser = null;
   }
 
-  static Future<String?> _accessToken(GoogleSignInAccount user) async {
-    await _ensureInitialized();
-
-    final auth = await user.authorizationClient.authorizationForScopes(_scopes);
-    if (auth != null && auth.accessToken.isNotEmpty) return auth.accessToken;
-
-    final ok = await user.authorizationClient.authorizeScopes(_scopes);
-    if (!ok) return null;
-
-    final auth2 = await user.authorizationClient.authorizationForScopes(_scopes);
-    if (auth2 == null || auth2.accessToken.isEmpty) return null;
-
-    return auth2.accessToken;
-  }
-
-  static Future<File> _localBackupFile() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return File('${dir.path}/$backupFileName');
-  }
-
-  /// Guarda local + sube a Google Drive (appDataFolder).
-  static Future<void> saveLocalAndUpload({
-    required Map<String, dynamic> data,
-  }) async {
-    // 1) Guardar local
-    final local = await _localBackupFile();
-    await local.writeAsString(jsonEncode(data));
-
-    // 2) Login
-    final user = await signInSilentlyOrNull() ?? await signInInteractive();
-    if (user == null) throw Exception('No se pudo iniciar sesión en Google.');
-
-    final token = await _accessToken(user);
-    if (token == null) throw Exception('No se pudo obtener token de Google Drive.');
-
-    final headers = <String, String>{'Authorization': 'Bearer $token'};
-
-    // 3) Buscar si existe archivo en appDataFolder
-    final q = Uri.encodeQueryComponent("name='$backupFileName'");
-    final listUrl = Uri.parse(
-      'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=$q&fields=files(id,name)',
-    );
-    final listRes = await http.get(listUrl, headers: headers);
-    if (listRes.statusCode >= 400) {
-      throw Exception('Error listando Drive: ${listRes.statusCode} ${listRes.body}');
+  static Future<String> _getAccessToken(GoogleSignInAccount user) async {
+    // 1) Si ya está autorizado, devuelve token.
+    final existing = await user.authorizationClient.authorizationForScopes(_scopes);
+    if (existing != null && existing.accessToken.isNotEmpty) {
+      return existing.accessToken;
     }
 
-    final files = (jsonDecode(listRes.body)['files'] as List?) ?? <dynamic>[];
-    final existingId = files.isNotEmpty ? files.first['id'] as String? : null;
+    // 2) Si no, pide autorización (esto devuelve un objeto, NO bool).
+    final granted = await user.authorizationClient.authorizeScopes(_scopes);
+    if (granted.accessToken.isNotEmpty) {
+      return granted.accessToken;
+    }
 
-    // 4) Subir (multipart/related)
-    final meta = <String, dynamic>{
-      'name': backupFileName,
-      'parents': ['appDataFolder'],
-    };
+    throw Exception('No se pudo obtener access token para Drive.');
+  }
+
+  static Future<String?> _findBackupFileId(String token) async {
+    final headers = <String, String>{'Authorization': 'Bearer $token'};
+
+    final q = Uri.encodeQueryComponent("name='$backupFileName'");
+    final url = Uri.parse(
+      'https://www.googleapis.com/drive/v3/files'
+      '?spaces=appDataFolder'
+      '&q=$q'
+      '&fields=files(id,name,modifiedTime)',
+    );
+
+    final res = await http.get(url, headers: headers);
+    if (res.statusCode >= 400) {
+      throw Exception('Drive list error: ${res.statusCode} ${res.body}');
+    }
+
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    final files = (body['files'] as List?) ?? <dynamic>[];
+    if (files.isEmpty) return null;
+
+    return files.first['id'] as String?;
+  }
+
+  /// Lo que tu backup_service.dart espera:
+  /// Sube JSON y devuelve DateTime? (modifiedTime en Drive).
+  static Future<DateTime?> uploadJson(String json) async {
+    final user = await ensureSignedIn(interactiveIfNeeded: true);
+    if (user == null) throw Exception('No se pudo iniciar sesión en Google.');
+
+    final token = await _getAccessToken(user);
+
+    final existingId = await _findBackupFileId(token);
 
     final boundary = '----gaboBoundary${DateTime.now().millisecondsSinceEpoch}';
-    final uploadHeaders = <String, String>{
+    final headers = <String, String>{
       'Authorization': 'Bearer $token',
       'Content-Type': 'multipart/related; boundary=$boundary',
     };
 
-    final metaPart = jsonEncode(meta);
-    final fileBytes = await local.readAsBytes();
+    final meta = jsonEncode(<String, dynamic>{
+      'name': backupFileName,
+      'parents': ['appDataFolder'],
+    });
+
+    final bytes = Uint8List.fromList(utf8.encode(json));
 
     final body = BytesBuilder()
       ..add(utf8.encode('--$boundary\r\n'))
       ..add(utf8.encode('Content-Type: application/json; charset=UTF-8\r\n\r\n'))
-      ..add(utf8.encode('$metaPart\r\n'))
+      ..add(utf8.encode('$meta\r\n'))
       ..add(utf8.encode('--$boundary\r\n'))
       ..add(utf8.encode('Content-Type: application/json\r\n\r\n'))
-      ..add(fileBytes)
+      ..add(bytes)
       ..add(utf8.encode('\r\n--$boundary--\r\n'));
 
     final uploadUrl = existingId == null
-        ? Uri.parse('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart')
-        : Uri.parse(
-            'https://www.googleapis.com/upload/drive/v3/files/$existingId?uploadType=multipart',
-          );
+        ? Uri.parse('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=modifiedTime')
+        : Uri.parse('https://www.googleapis.com/upload/drive/v3/files/$existingId?uploadType=multipart&fields=modifiedTime');
 
-    final uploadRes = existingId == null
-        ? await http.post(uploadUrl, headers: uploadHeaders, body: body.toBytes())
-        : await http.patch(uploadUrl, headers: uploadHeaders, body: body.toBytes());
+    final res = existingId == null
+        ? await http.post(uploadUrl, headers: headers, body: body.toBytes())
+        : await http.patch(uploadUrl, headers: headers, body: body.toBytes());
 
-    if (uploadRes.statusCode >= 400) {
-      throw Exception('Error subiendo a Drive: ${uploadRes.statusCode} ${uploadRes.body}');
+    if (res.statusCode >= 400) {
+      throw Exception('Drive upload error: ${res.statusCode} ${res.body}');
     }
+
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final mt = data['modifiedTime'] as String?;
+    return mt == null ? null : DateTime.tryParse(mt);
   }
 
-  /// Descarga desde Drive y devuelve el JSON (también lo guarda local).
-  static Future<Map<String, dynamic>> downloadAndLoad() async {
-    final user = await signInSilentlyOrNull() ?? await signInInteractive();
+  /// Lo que tu backup_service.dart espera:
+  /// Descarga el JSON desde appDataFolder (si no existe, lanza error).
+  static Future<String> downloadJson() async {
+    final user = await ensureSignedIn(interactiveIfNeeded: true);
     if (user == null) throw Exception('No se pudo iniciar sesión en Google.');
 
-    final token = await _accessToken(user);
-    if (token == null) throw Exception('No se pudo obtener token de Google Drive.');
+    final token = await _getAccessToken(user);
+
+    final fileId = await _findBackupFileId(token);
+    if (fileId == null) {
+      throw Exception('No hay respaldo en Drive todavía.');
+    }
 
     final headers = <String, String>{'Authorization': 'Bearer $token'};
+    final url = Uri.parse('https://www.googleapis.com/drive/v3/files/$fileId?alt=media');
 
+    final res = await http.get(url, headers: headers);
+    if (res.statusCode >= 400) {
+      throw Exception('Drive download error: ${res.statusCode} ${res.body}');
+    }
+
+    return res.body;
+  }
+
+  /// Lo que tu backup_service.dart espera:
+  static Future<DateTime?> getBackupModifiedTime() async {
+    final user = await ensureSignedIn(interactiveIfNeeded: false);
+    if (user == null) return null;
+
+    final token = await _getAccessToken(user);
+
+    final headers = <String, String>{'Authorization': 'Bearer $token'};
     final q = Uri.encodeQueryComponent("name='$backupFileName'");
-    final listUrl = Uri.parse(
-      'https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=$q&fields=files(id,name)',
+    final url = Uri.parse(
+      'https://www.googleapis.com/drive/v3/files'
+      '?spaces=appDataFolder'
+      '&q=$q'
+      '&fields=files(modifiedTime)',
     );
-    final listRes = await http.get(listUrl, headers: headers);
-    if (listRes.statusCode >= 400) {
-      throw Exception('Error listando Drive: ${listRes.statusCode} ${listRes.body}');
-    }
 
-    final files = (jsonDecode(listRes.body)['files'] as List?) ?? <dynamic>[];
-    if (files.isEmpty) throw Exception('No hay respaldo en Drive todavía.');
+    final res = await http.get(url, headers: headers);
+    if (res.statusCode >= 400) return null;
 
-    final fileId = files.first['id'] as String;
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    final files = (body['files'] as List?) ?? <dynamic>[];
+    if (files.isEmpty) return null;
 
-    final dlUrl = Uri.parse('https://www.googleapis.com/drive/v3/files/$fileId?alt=media');
-    final dlRes = await http.get(dlUrl, headers: headers);
-    if (dlRes.statusCode >= 400) {
-      throw Exception('Error descargando Drive: ${dlRes.statusCode} ${dlRes.body}');
-    }
-
-    final decoded = jsonDecode(dlRes.body) as Map<String, dynamic>;
-
-    // Guardar local también
-    final local = await _localBackupFile();
-    await local.writeAsString(jsonEncode(decoded));
-
-    return decoded;
+    final mt = files.first['modifiedTime'] as String?;
+    return mt == null ? null : DateTime.tryParse(mt);
   }
 }
