@@ -3,18 +3,16 @@ workflows:
     name: Android Release
     environment:
       flutter: stable
-      # Si tu workflow permite fijar versión exacta, mejor:
-      # flutter: 3.29.0
-      android_signing:
-        - keystore_reference
-      vars:
-        PACKAGE_NAME: "tu.applicationId.aqui"
+
     scripts:
       - name: Flutter doctor
         script: flutter doctor -v
+
       - name: Pub get
         script: flutter pub get
+
       - name: Build APK release
         script: flutter build apk --release
+
     artifacts:
       - build/app/outputs/flutter-apk/app-release.apk
