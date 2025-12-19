@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace "TU.PACKAGE.AQUI"
+    namespace "com.gabo.vinylapp"
     compileSdkVersion flutter.compileSdkVersion
 
     defaultConfig {
@@ -39,5 +39,6 @@ flutter {
 
        
     
+
 
 
