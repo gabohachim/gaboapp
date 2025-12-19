@@ -5,7 +5,9 @@ plugins {
 }
 
 android {
-    namespace "com.example.app" // <- cambia por tu package real
+    namespace "com.gabo.vinylapp"
+applicationId "com.gabo.vinylapp"
+
     compileSdkVersion flutter.compileSdkVersion
 
     defaultConfig {
@@ -41,3 +43,4 @@ flutter {
 dependencies {
     // normalmente Flutter maneja dependencias; deja vacío si no necesitas nada extra
 }
+
